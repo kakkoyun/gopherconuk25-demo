@@ -10,6 +10,8 @@ import (
 	"log"
 	"os"
 	"strings"
+
+	"golang.org/x/tools/go/ast/astutil"
 )
 
 func main() {
@@ -27,15 +29,16 @@ func main() {
 	}
 
 	modified := false
-	for _, decl := range node.Decls {
-		if fn, ok := decl.(*ast.FuncDecl); ok {
+	astutil.Apply(node, func(cursor *astutil.Cursor) bool {
+		if fn, ok := cursor.Node().(*ast.FuncDecl); ok {
 			if hasLogComment(node, fn) {
 				removeLogComment(node, fn)
 				injectLogging(fn)
 				modified = true
 			}
 		}
-	}
+		return true
+	}, nil)
 
 	if !modified {
 		fmt.Printf("No functions with //dd:log comment found in %s\n", filename)
@@ -43,7 +46,7 @@ func main() {
 	}
 
 	// Add required imports and init function
-	addRequiredImports(node)
+	addRequiredImports(fset, node)
 	addLoggerInit(node)
 
 	var buf bytes.Buffer
@@ -63,6 +66,7 @@ func main() {
 func hasLogComment(file *ast.File, fn *ast.FuncDecl) bool {
 	fnPos := fn.Pos()
 	for _, commentGroup := range file.Comments {
+		// Only check comments that end before the function starts
 		if commentGroup.End() < fnPos {
 			for _, comment := range commentGroup.List {
 				if strings.Contains(comment.Text, "dd:log") {
@@ -189,80 +193,44 @@ func injectLogging(fn *ast.FuncDecl) {
 }
 
 // addRequiredImports ensures the required imports are present
-func addRequiredImports(file *ast.File) {
-	requiredImports := map[string]string{
-		"log/slog": "slog",
-		"os":       "",
-		"time":     "",
-	}
-
-	// Check existing imports
-	existingImports := make(map[string]bool)
-	for _, imp := range file.Imports {
-		path := strings.Trim(imp.Path.Value, `"`)
-		existingImports[path] = true
-	}
-
-	// Add missing imports
-	var newImports []*ast.ImportSpec
-	for path, name := range requiredImports {
-		if !existingImports[path] {
-			importSpec := &ast.ImportSpec{
-				Path: &ast.BasicLit{
-					Kind:  token.STRING,
-					Value: fmt.Sprintf(`"%s"`, path),
-				},
-			}
-			if name != "" {
-				importSpec.Name = ast.NewIdent(name)
-			}
-			newImports = append(newImports, importSpec)
-		}
-	}
-
-	// Add imports to the file
-	if len(newImports) > 0 {
-		// Find or create import declaration
-		var importDecl *ast.GenDecl
-		for _, decl := range file.Decls {
-			if genDecl, ok := decl.(*ast.GenDecl); ok && genDecl.Tok == token.IMPORT {
-				importDecl = genDecl
-				break
-			}
-		}
-
-		if importDecl == nil {
-			// Create new import declaration
-			importDecl = &ast.GenDecl{
-				Tok: token.IMPORT,
-			}
-			// Insert at the beginning after package declaration
-			newDecls := []ast.Decl{importDecl}
-			newDecls = append(newDecls, file.Decls...)
-			file.Decls = newDecls
-		}
-
-		// Add new imports
-		for _, newImport := range newImports {
-			importDecl.Specs = append(importDecl.Specs, newImport)
-		}
-	}
+func addRequiredImports(fset *token.FileSet, file *ast.File) {
+	astutil.AddNamedImport(fset, file, "slog", "log/slog")
+	astutil.AddImport(fset, file, "os")
+	astutil.AddImport(fset, file, "time")
 }
 
 // addLoggerInit adds an init function to configure the slog logger
 func addLoggerInit(file *ast.File) {
 	// Check if init function already exists
-	for _, decl := range file.Decls {
-		if fn, ok := decl.(*ast.FuncDecl); ok {
-			if fn.Name.Name == "init" {
-				// Init function already exists, don't add another
-				return
-			}
+	initExists := false
+	astutil.Apply(file, func(cursor *astutil.Cursor) bool {
+		if fn, ok := cursor.Node().(*ast.FuncDecl); ok && fn.Name.Name == "init" {
+			initExists = true
+			return false // Stop traversal early
 		}
+		return true
+	}, nil)
+
+	if initExists {
+		return
 	}
 
 	// Create init function
-	initFunc := &ast.FuncDecl{
+	initFunc := createInitFunction()
+
+	// Insert init function after imports
+	astutil.Apply(file, func(cursor *astutil.Cursor) bool {
+		if genDecl, ok := cursor.Node().(*ast.GenDecl); ok && genDecl.Tok == token.IMPORT {
+			cursor.InsertAfter(initFunc)
+			return false // Stop traversal after first import declaration
+		}
+		return true
+	}, nil)
+}
+
+// createInitFunction creates the init function AST node
+func createInitFunction() *ast.FuncDecl {
+	return &ast.FuncDecl{
 		Name: ast.NewIdent("init"),
 		Type: &ast.FuncType{
 			Params: &ast.FieldList{},
@@ -335,23 +303,4 @@ func addLoggerInit(file *ast.File) {
 			},
 		},
 	}
-
-	// Insert init function after imports but before other functions
-	var insertIndex int
-	for i, decl := range file.Decls {
-		if genDecl, ok := decl.(*ast.GenDecl); ok && genDecl.Tok == token.IMPORT {
-			insertIndex = i + 1
-		} else if _, ok := decl.(*ast.FuncDecl); ok {
-			break
-		} else {
-			insertIndex = i + 1
-		}
-	}
-
-	// Insert the init function
-	newDecls := make([]ast.Decl, 0, len(file.Decls)+1)
-	newDecls = append(newDecls, file.Decls[:insertIndex]...)
-	newDecls = append(newDecls, initFunc)
-	newDecls = append(newDecls, file.Decls[insertIndex:]...)
-	file.Decls = newDecls
 }
